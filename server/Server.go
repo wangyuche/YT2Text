@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"html/template"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 
@@ -56,7 +57,7 @@ func WSInit(app *fiber.App) {
 			c:                   c,
 			cmd:                 "idle",
 			downloadcomplete:    make(chan bool, 1),
-			text:                make(chan string),
+			text:                make(chan string, 1),
 			getcaptionscomplete: make(chan bool, 1),
 		}
 		Clients[c].ReadMessage()
@@ -79,6 +80,7 @@ type Client struct {
 	downloadcomplete    chan bool
 	text                chan string
 	getcaptionscomplete chan bool
+	file                string
 }
 
 func (this *Client) ReadMessage() {
@@ -109,7 +111,7 @@ func (this *Client) ReadMessage() {
 						rep.Cmd = Clients[this.c].cmd
 						jsondata, _ := json.Marshal(rep)
 						Clients[this.c].WriteMessage(string(jsondata))
-						go getcaptions(Clients[this.c].text, Clients[this.c].getcaptionscomplete)
+						go getcaptions(Clients[this.c].text, Clients[this.c].getcaptionscomplete, Clients[this.c].file)
 					} else {
 						Clients[this.c].cmd = "idle"
 						var rep YTRep
@@ -136,7 +138,18 @@ func (this *Client) ReadMessage() {
 		switch req.Cmd {
 		case "downloadyt":
 			if Clients[this.c].cmd == "idle" {
-				go download_ytvideo(req.Data, Clients[this.c].downloadcomplete)
+				u, err := url.Parse(req.Data)
+				if err != nil {
+					log.Error(err.Error())
+					break
+				}
+				m, err := url.ParseQuery(u.RawQuery)
+				if err != nil {
+					log.Error(err.Error())
+					break
+				}
+				go download_ytvideo(m["v"][0], Clients[this.c].downloadcomplete)
+				Clients[this.c].file = m["v"][0]
 				Clients[this.c].cmd = "downloadyt"
 				Clients[this.c].WriteMessage(string(msg))
 			}
@@ -160,8 +173,8 @@ func (this *Client) WriteMessage(data string) {
 	}
 }
 
-func getcaptions(text chan string, getcaptionscomplete chan bool) {
-	cmd := exec.Command("whisper", "/Users/arieswang/Documents/git/YT2Text/server/video.mp4", "--fp16", "False")
+func getcaptions(text chan string, getcaptionscomplete chan bool, file string) {
+	cmd := exec.Command("whisper", "/Users/arieswang/Documents/git/YT2Text/server/"+file+".mp4", "--fp16", "False")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Error(err.Error())
@@ -208,11 +221,7 @@ func download_ytvideo(url string, downloadcomplete chan bool) {
 		downloadcomplete <- false
 		return
 	}
-	err = os.Remove("video.mp4")
-	if err != nil {
-		log.Error(err.Error())
-	}
-	file, err := os.Create("video.mp4")
+	file, err := os.Create(url + ".mp4")
 	if err != nil {
 		log.Error(err.Error())
 		downloadcomplete <- false

@@ -25,7 +25,7 @@ class _MainPageState extends State<MainPageScreen> {
     _process = "閒置中";
     _timetext = [];
     _notimetext = [];
-    YTURL.text = "https://www.youtube.com/watch?v=BaW_jenozKc";
+    //YTURL.text = "https://www.youtube.com/watch?v=BaW_jenozKc";
     //YTURL.text = "https://www.youtube.com/watch?v=C3-rChnzCw4";
     channel = WebSocketChannel.connect(
         Uri.parse('ws://' + Uri.base.host + ':8080/ws'));

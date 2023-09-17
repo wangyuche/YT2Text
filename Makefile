@@ -9,6 +9,9 @@ build_img:
 build_web:
 		cd flutter && flutter build web
 
+build_server:
+		cd flutter && flutter build web
+
 copy_web:
 		rm -rf server/web
 		cp -r flutter/build/web server/web
