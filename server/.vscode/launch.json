@@ -13,8 +13,13 @@
             "env": {
                 "Port": ":8080",
                 "LogType": "console",
-                "LogShowTime": "True"
-            }
+                "LogShowTime": "True",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/Users/arieswang/.config/gcloud/application_default_credentials.json"
+            },
+            "args": [
+                "-s",
+                "./data/yt.txt"
+            ]
         }
     ]
 }

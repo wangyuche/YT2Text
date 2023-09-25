@@ -27,6 +27,7 @@ class _MainPageState extends State<MainPageScreen> {
     _notimetext = [];
     //YTURL.text = "https://www.youtube.com/watch?v=BaW_jenozKc";
     //YTURL.text = "https://www.youtube.com/watch?v=C3-rChnzCw4";
+    //YTURL.text = https://www.youtube.com/watch?v=LHFOaHShAoU";
     channel = WebSocketChannel.connect(
         Uri.parse('ws://' + Uri.base.host + ':8080/ws'));
 
@@ -140,7 +141,7 @@ class _MainPageState extends State<MainPageScreen> {
                                   _timetext = [];
                                   _notimetext = [];
                                 });
-                                YTReq ytreq = YTReq("downloadyt", YTURL.text);
+                                YTReq ytreq = YTReq("addqueen", YTURL.text);
                                 channel.sink.add(jsonEncode(ytreq.toJson()));
                               },
                             ),
@@ -183,7 +184,7 @@ class _MainPageState extends State<MainPageScreen> {
                           IconButton(
                               icon: Icon(Icons.download),
                               onPressed: () {
-                                filetext="";
+                                filetext = "";
                                 var _t = _timetext;
                                 if (!istimestamp) {
                                   _t = _notimetext;

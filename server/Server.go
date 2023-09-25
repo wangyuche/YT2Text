@@ -2,19 +2,35 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"flag"
 	"html/template"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"sync"
+	"time"
 
+	"cloud.google.com/go/translate"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/template/html/v2"
 	"github.com/gofiber/websocket/v2"
 	"github.com/kkdai/youtube/v2"
 	"github.com/wangyuche/goutils/log"
+	"golang.org/x/text/language"
 )
+
+type FileInfo struct {
+	url    string
+	name   string
+	status string
+}
+
+var ytqueen map[string]FileInfo
+var mutex sync.RWMutex
+var source string
 
 func Setup() *fiber.App {
 	engine := html.New("./web", ".html")
@@ -36,10 +52,139 @@ func Setup() *fiber.App {
 }
 
 func main() {
+	ytqueen = make(map[string]FileInfo)
 	log.New(log.LogType(os.Getenv("LogType")))
-	app := Setup()
-	log.Info("Listen Port" + os.Getenv("Port"))
-	app.Listen(os.Getenv("Port"))
+	if len(os.Args) > 1 {
+		log.Info("Start")
+		flag.StringVar(&source, "s", "yt.txt", "YT URL")
+		flag.Parse()
+		mutex.Lock()
+		file, err := os.Open(source)
+		if err != nil {
+			log.Fail(err.Error())
+		}
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			u, err := url.Parse(scanner.Text())
+			if err != nil {
+				log.Fail(err.Error())
+				break
+			}
+			m, err := url.ParseQuery(u.RawQuery)
+			if err != nil {
+				log.Fail(err.Error())
+				break
+			}
+			var f FileInfo
+			f.url = scanner.Text()
+			f.name = m["v"][0]
+			f.status = "idle"
+			ytqueen[m["v"][0]] = f
+		}
+		if err := scanner.Err(); err != nil {
+			log.Fail(err.Error())
+		}
+		mutex.Unlock()
+		ProcessQueen()
+	} else {
+		app := Setup()
+		log.Info("Listen Port" + os.Getenv("Port"))
+		go ProcessQueen()
+		app.Listen(os.Getenv("Port"))
+	}
+}
+
+func ProcessQueen() {
+	var downloadcomplete chan string = make(chan string, 5)
+	var getcaptionscomplete chan string = make(chan string, 5)
+	go func() {
+		for {
+			select {
+			case k := <-downloadcomplete:
+				if k != "" {
+					mutex.Lock()
+					y := ytqueen[k]
+					y.status = "downloadcomplete"
+					ytqueen[k] = y
+					mutex.Unlock()
+				}
+			case k := <-getcaptionscomplete:
+				log.Info("Complete:" + k)
+				if k != "" {
+					mutex.Lock()
+					y := ytqueen[k]
+					y.status = "complete"
+					ytqueen[k] = y
+					mutex.Unlock()
+					var zh string = ""
+					var i int = 0
+					file, err := os.Open("./data/" + k + ".srt")
+					if err != nil {
+						log.Error(err.Error())
+						break
+					}
+					scanner := bufio.NewScanner(file)
+					for scanner.Scan() {
+						if i != 2 {
+							zh = zh + scanner.Text() + "\r\n"
+							i++
+							if i == 4 {
+								i = 0
+							}
+						} else {
+							zh = zh + translateText(scanner.Text()) + "\r\n"
+							i++
+						}
+					}
+					log.Info(zh)
+					file.Close()
+					f, err := os.Create("./data/" + k + "_zh.srt")
+
+					if err != nil {
+						log.Fail(err.Error())
+						f.Close()
+					}
+					_, err2 := f.WriteString(zh)
+					if err2 != nil {
+						log.Fail(err.Error())
+						f.Close()
+					}
+					f.Close()
+
+				}
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}()
+
+	for {
+		var c map[string]FileInfo = map[string]FileInfo{}
+		mutex.Lock()
+		for k, v := range ytqueen {
+			c[k] = v
+		}
+		mutex.Unlock()
+		for k, v := range c {
+			if v.status == "idle" {
+				mutex.Lock()
+				y := ytqueen[k]
+				y.status = "downloading"
+				ytqueen[k] = y
+				mutex.Unlock()
+				go download_ytvideo(k, downloadcomplete)
+			}
+			if v.status == "downloadcomplete" {
+				mutex.Lock()
+				y := ytqueen[k]
+				y.status = "captionsing"
+				ytqueen[k] = y
+				mutex.Unlock()
+				getcaptions(getcaptionscomplete, k)
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 var Clients map[*websocket.Conn]*Client = make(map[*websocket.Conn]*Client)
@@ -54,11 +199,7 @@ func WSInit(app *fiber.App) {
 	})
 	app.Get("/ws", websocket.New(func(c *websocket.Conn) {
 		Clients[c] = &Client{
-			c:                   c,
-			cmd:                 "idle",
-			downloadcomplete:    make(chan bool, 1),
-			text:                make(chan string, 1),
-			getcaptionscomplete: make(chan bool, 1),
+			c: c,
 		}
 		Clients[c].ReadMessage()
 	}))
@@ -70,17 +211,12 @@ type YTReq struct {
 }
 
 type YTRep struct {
-	Cmd  string `json:"cmd"`
-	Data string `json:"data"`
+	Cmd  string     `json:"cmd"`
+	Data []FileInfo `json:"data"`
 }
 
 type Client struct {
-	c                   *websocket.Conn
-	cmd                 string
-	downloadcomplete    chan bool
-	text                chan string
-	getcaptionscomplete chan bool
-	file                string
+	c *websocket.Conn
 }
 
 func (this *Client) ReadMessage() {
@@ -101,62 +237,38 @@ func (this *Client) ReadMessage() {
 			log.Error(err.Error())
 		}
 
-		go func() {
-			for {
-				select {
-				case r := <-Clients[this.c].downloadcomplete:
-					if r == true {
-						Clients[this.c].cmd = "getcaptions"
-						var rep YTRep
-						rep.Cmd = Clients[this.c].cmd
-						jsondata, _ := json.Marshal(rep)
-						Clients[this.c].WriteMessage(string(jsondata))
-						go getcaptions(Clients[this.c].text, Clients[this.c].getcaptionscomplete, Clients[this.c].file)
-					} else {
-						Clients[this.c].cmd = "idle"
-						var rep YTRep
-						rep.Cmd = Clients[this.c].cmd
-						jsondata, _ := json.Marshal(rep)
-						Clients[this.c].WriteMessage(string(jsondata))
-					}
-				case d := <-Clients[this.c].text:
-					var rep YTRep
-					rep.Cmd = "getcaptions"
-					rep.Data = d
-					jsondata, _ := json.Marshal(rep)
-					Clients[this.c].WriteMessage(string(jsondata))
-				case <-Clients[this.c].getcaptionscomplete:
-					Clients[this.c].cmd = "idle"
-					var rep YTRep
-					rep.Cmd = Clients[this.c].cmd
-					jsondata, _ := json.Marshal(rep)
-					Clients[this.c].WriteMessage(string(jsondata))
-				}
-			}
-		}()
-
 		switch req.Cmd {
-		case "downloadyt":
-			if Clients[this.c].cmd == "idle" {
-				u, err := url.Parse(req.Data)
-				if err != nil {
-					log.Error(err.Error())
-					break
-				}
-				m, err := url.ParseQuery(u.RawQuery)
-				if err != nil {
-					log.Error(err.Error())
-					break
-				}
-				go download_ytvideo(m["v"][0], Clients[this.c].downloadcomplete)
-				Clients[this.c].file = m["v"][0]
-				Clients[this.c].cmd = "downloadyt"
-				Clients[this.c].WriteMessage(string(msg))
+		case "addqueen":
+			u, err := url.Parse(req.Data)
+			if err != nil {
+				log.Error(err.Error())
+				break
 			}
-		case "status":
+			m, err := url.ParseQuery(u.RawQuery)
+			if err != nil {
+				log.Error(err.Error())
+				break
+			}
+			mutex.Lock()
+			_, ok := ytqueen[m["v"][0]]
+			if !ok {
+				var f FileInfo
+				f.url = req.Data
+				f.name = m["v"][0]
+				f.status = "idle"
+				ytqueen[m["v"][0]] = f
+			}
+			mutex.Unlock()
+		case "getqueen":
+			var v []FileInfo = make([]FileInfo, 0)
+			mutex.Lock()
+			for _, value := range ytqueen {
+				v = append(v, value)
+			}
+			mutex.Unlock()
 			var rep YTRep
-			rep.Cmd = "status"
-			rep.Data = Clients[this.c].cmd
+			rep.Cmd = "getqueen"
+			rep.Data = v
 			jsondata, _ := json.Marshal(rep)
 			Clients[this.c].WriteMessage(string(jsondata))
 		}
@@ -173,8 +285,9 @@ func (this *Client) WriteMessage(data string) {
 	}
 }
 
-func getcaptions(text chan string, getcaptionscomplete chan bool, file string) {
-	cmd := exec.Command("whisper", "/Users/arieswang/Documents/git/YT2Text/server/"+file+".mp4", "--fp16", "False")
+func getcaptions(getcaptionscomplete chan string, file string) {
+	log.Info("getcaptions:" + file)
+	cmd := exec.Command("whisper", "./data/"+file+".mp4", "--fp16", "False", "--output_dir", "./data")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Error(err.Error())
@@ -191,26 +304,24 @@ func getcaptions(text chan string, getcaptionscomplete chan bool, file string) {
 	for scanner.Scan() {
 		m := scanner.Text()
 		log.Info(m)
-		text <- m
 	}
 	scannererr := bufio.NewScanner(stderr)
 	for scannererr.Scan() {
 		e := scannererr.Text()
 		log.Info(e)
-		text <- e
 	}
 	cmd.Wait()
-	getcaptionscomplete <- true
+	getcaptionscomplete <- file
 }
 
-func download_ytvideo(url string, downloadcomplete chan bool) {
+func download_ytvideo(url string, downloadcomplete chan string) {
 	videoID := url
 	client := youtube.Client{}
 
 	video, err := client.GetVideo(videoID)
 	if err != nil {
 		log.Error(err.Error())
-		downloadcomplete <- false
+		downloadcomplete <- ""
 		return
 	}
 
@@ -218,21 +329,49 @@ func download_ytvideo(url string, downloadcomplete chan bool) {
 	stream, _, err := client.GetStream(video, &formats[0])
 	if err != nil {
 		log.Error(err.Error())
-		downloadcomplete <- false
+		downloadcomplete <- ""
 		return
 	}
-	file, err := os.Create(url + ".mp4")
+	file, err := os.Create("data/" + url + ".mp4")
 	if err != nil {
 		log.Error(err.Error())
-		downloadcomplete <- false
+		downloadcomplete <- ""
 		return
 	}
 	defer file.Close()
 	_, err = io.Copy(file, stream)
 	if err != nil {
 		log.Error(err.Error())
-		downloadcomplete <- false
+		downloadcomplete <- ""
 		return
 	}
-	downloadcomplete <- true
+	downloadcomplete <- url
+}
+
+func translateText(text string) string {
+	ctx := context.Background()
+
+	lang, err := language.Parse("zh-TW")
+	if err != nil {
+		log.Error(err.Error())
+		return ""
+	}
+
+	client, err := translate.NewClient(ctx)
+	if err != nil {
+		log.Error(err.Error())
+		return ""
+	}
+	defer client.Close()
+
+	resp, err := client.Translate(ctx, []string{text}, lang, nil)
+	if err != nil {
+		log.Error(err.Error())
+		return ""
+	}
+	if len(resp) == 0 {
+		log.Error(err.Error())
+		return ""
+	}
+	return resp[0].Text
 }
